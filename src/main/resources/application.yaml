@@ -1,0 +1,54 @@
+spring:
+  application:
+    name: prepline-auth
+
+  autoconfigure:
+    exclude: org.springframework.boot.autoconfigure.security.servlet.UserDetailsServiceAutoConfiguration
+
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/prepline_auth}
+    username: ${DB_USERNAME:postgres}
+    password: ${DB_PASSWORD:postgres123}
+    driver-class-name: org.postgresql.Driver
+    hikari:
+      maximum-pool-size: 20
+      minimum-idle: 5
+      connection-timeout: 10000
+      idle-timeout: 300000
+      max-lifetime: 600000
+      leak-detection-threshold: 15000
+
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: true
+    properties:
+      hibernate:
+        default_batch_fetch_size: 20
+
+  mail:
+    host: smtp.gmail.com
+    port: 587
+    username: ${GMAIL_USERNAME:dev@gmail.com}
+    password: ${GMAIL_APP_PASSWORD:dev-password}
+    properties:
+      mail:
+        smtp:
+          auth: true
+          starttls:
+            enable: true
+            required: true
+          connectiontimeout: 5000
+          timeout: 5000
+          writetimeout: 5000
+    default-encoding: UTF-8
+
+jwt:
+  secret: ${JWT_SECRET:prepline-local-dev-secret-key-minimum-32chars}
+  expiration: ${JWT_EXPIRATION_MS:86400000}
+
+kitchen:
+  staff-max-concurrent-orders: 5
+  order-intake-buffer-multiplier: 2
+  avg-cook-time-minutes: 7
+  board-poll-interval-seconds: 10

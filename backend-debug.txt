@@ -1,0 +1,300 @@
+package com.prepline.kitchen.metrics;
+
+import com.prepline.kitchen.metrics.dto.KitchenMetricsDto;
+import com.prepline.kitchen.order.domain.Order;
+import com.prepline.kitchen.order.repository.OrderRepository;
+import com.prepline.kitchen.staff.repository.KitchenStaffRepository;
+import lombok.RequiredArgsConstructor;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.time.Duration;
+import java.time.Instant;
+import java.time.LocalDate;
+import java.util.List;
+
+@Service
+@Transactional(readOnly = true)
+@RequiredArgsConstructor
+public class MetricsService {
+
+    private final OrderRepository orderRepository;
+    private final KitchenStaffRepository staffRepository;
+
+    public KitchenMetricsDto computeMetrics(LocalDate date) {
+        List<Order> completed = orderRepository.findCompletedOnDate(date);
+
+        double avgCookTimeMinutes = completed.stream()
+                .filter(o -> o.getCookingStartedAt() != null && o.getReadyAt() != null)
+                .mapToLong(o -> Duration.between(o.getCookingStartedAt(), o.getReadyAt()).toMinutes())
+                .average()
+                .orElse(0);
+
+        long onTime = completed.stream()
+                .filter(this::wasReadyBeforeSlotDeadline)
+                .count();
+
+        double efficiency = completed.isEmpty() ? 100.0
+                : (onTime * 100.0) / completed.size();
+
+        long activeChefs = staffRepository.countByActiveTodayTrue();
+        int chefsAtCapacity = staffRepository.countChefsAtMaxLoad();
+        double capacityUtilization = activeChefs == 0 ? 0
+                : (chefsAtCapacity * 100.0) / activeChefs;
+
+        return new KitchenMetricsDto(avgCookTimeMinutes, efficiency, capacityUtilization, completed.size());
+    }
+
+    private boolean wasReadyBeforeSlotDeadline(Order order) {
+        if (order.getReadyAt() == null || order.getPickupSlot() == null) return false;
+        Instant deadline = order.getPickupSlot().getSlotTime()
+                .atZone(java.time.ZoneId.systemDefault()).toInstant();
+        return order.getReadyAt().isBefore(deadline);
+    }
+}
+package com.prepline.kitchen.order.service;
+
+import com.prepline.kitchen.menu.domain.MenuItem;
+import com.prepline.kitchen.menu.repository.MenuItemRepository;
+import com.prepline.kitchen.order.domain.Order;
+import com.prepline.kitchen.order.domain.OrderItem;
+import com.prepline.kitchen.order.domain.OrderStatus;
+import com.prepline.kitchen.order.repository.OrderRepository;
+import lombok.RequiredArgsConstructor;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.UUID;
+
+@Service
+@Transactional
+@RequiredArgsConstructor
+public class OrderService {
+
+    private final OrderRepository orderRepository;
+    private final MenuItemRepository menuItemRepository;
+
+    public Order createOrder(String orderRef, List<UUID> menuItemIds) {
+        List<OrderItem> items = new ArrayList<>();
+        int totalPrep = 0;
+
+        Order order = Order.builder()
+                .orderRef(orderRef)
+                .status(OrderStatus.PENDING)
+                .placedAt(Instant.now())
+                .build();
+
+        for (UUID menuItemId : menuItemIds) {
+            MenuItem menuItem = menuItemRepository.findById(menuItemId)
+                    .orElseThrow(() -> new RuntimeException("MenuItem not found: " + menuItemId));
+
+            OrderItem item = OrderItem.builder()
+                    .order(order)
+                    .menuItem(menuItem)
+                    .quantity(1)
+                    .prepTimeMinutes(menuItem.getPrepTimeMinutes()) // snapshot
+                    .build();
+
+            items.add(item);
+            totalPrep += menuItem.getPrepTimeMinutes();
+        }
+
+        order.setItems(items);
+        order.setTotalPrepTimeMinutes(totalPrep);
+
+        return orderRepository.save(order);
+    }
+
+    @Transactional(readOnly = true)
+    public Order getById(UUID orderId) {
+        return orderRepository.findById(orderId)
+                .orElseThrow(() -> new RuntimeException("Order not found: " + orderId));
+    }
+}
+package com.prepline.kitchen.order.service;
+
+import com.prepline.kitchen.order.domain.Order;
+import com.prepline.kitchen.order.domain.OrderStatus;
+import com.prepline.kitchen.order.dto.KanbanBoardResponse;
+import com.prepline.kitchen.order.dto.OrderCardDto;
+import com.prepline.kitchen.order.repository.OrderRepository;
+import com.prepline.kitchen.metrics.MetricsService;
+import com.prepline.kitchen.metrics.dto.KitchenMetricsDto;
+import com.prepline.kitchen.slot.domain.PickupSlot;
+import com.prepline.kitchen.slot.dto.SlotCapacityDto;
+import com.prepline.kitchen.slot.repository.PickupSlotRepository;
+import com.prepline.kitchen.staff.domain.KitchenStaff;
+import com.prepline.kitchen.staff.dto.StaffWorkloadDto;
+import com.prepline.kitchen.staff.repository.KitchenStaffRepository;
+import lombok.RequiredArgsConstructor;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.time.Duration;
+import java.time.Instant;
+import java.time.LocalDate;
+import java.time.ZoneId;
+import java.util.*;
+import java.util.stream.Collectors;
+
+@Service
+@Transactional(readOnly = true)
+@RequiredArgsConstructor
+public class OrderQueryService {
+
+    private final OrderRepository orderRepository;
+    private final KitchenStaffRepository staffRepository;
+    private final PickupSlotRepository slotRepository;
+    private final MetricsService metricsService;
+
+    public KanbanBoardResponse getBoardSnapshot() {
+        // Build columns
+        Map<OrderStatus, List<OrderCardDto>> columns = new LinkedHashMap<>();
+        for (OrderStatus status : List.of(
+                OrderStatus.PENDING,
+                OrderStatus.COOKING,
+                OrderStatus.READY,
+                OrderStatus.COMPLETED)) {
+            List<OrderCardDto> cards = orderRepository.findByStatus(status)
+                    .stream()
+                    .map(this::toCardDto)
+                    .collect(Collectors.toList());
+            columns.put(status, cards);
+        }
+
+        // Staff workload — count only PENDING + COOKING orders per chef
+        List<StaffWorkloadDto> staffWorkload = staffRepository.findByActiveTodayTrue()
+                .stream()
+                .map(chef -> toStaffWorkloadDto(chef))
+                .collect(Collectors.toList());
+
+        // Upcoming slot capacity
+        List<SlotCapacityDto> slots = slotRepository.findAll()
+                .stream()
+                .map(this::toSlotCapacityDto)
+                .collect(Collectors.toList());
+
+        // Metrics for today
+        KitchenMetricsDto metrics = metricsService.computeMetrics(LocalDate.now());
+
+        return new KanbanBoardResponse(columns, metrics, staffWorkload, slots);
+    }
+
+    private OrderCardDto toCardDto(Order order) {
+        List<String> itemSummary = order.getItems() == null ? List.of() :
+                order.getItems().stream()
+                        .map(i -> i.getQuantity() + "x " + i.getMenuItem().getName())
+                        .collect(Collectors.toList());
+
+        String chefName = order.getAssignedChef() != null
+                ? order.getAssignedChef().getName() : null;
+
+        String slotTime = order.getPickupSlot() != null
+                ? order.getPickupSlot().getSlotTime().toString() : null;
+
+        Instant reference = order.getCookingStartedAt() != null
+                ? order.getCookingStartedAt() : order.getPlacedAt();
+
+        long elapsed = reference != null
+                ? Duration.between(reference, Instant.now()).toMinutes() : 0;
+
+        boolean isLate = false;
+        if (order.getPickupSlot() != null && order.getPlacedAt() != null) {
+            Instant deadline = order.getPickupSlot().getSlotTime()
+                    .atZone(ZoneId.systemDefault()).toInstant();
+            Instant estimatedReady = (reference != null ? reference : Instant.now())
+                    .plusSeconds((order.getTotalPrepTimeMinutes() != null
+                            ? order.getTotalPrepTimeMinutes() : 0) * 60L);
+            isLate = estimatedReady.isAfter(deadline);
+        }
+
+        return new OrderCardDto(
+                order.getId(),
+                order.getOrderRef(),
+                order.getStatus(),
+                itemSummary,
+                chefName,
+                slotTime,
+                order.getTotalPrepTimeMinutes() != null ? order.getTotalPrepTimeMinutes() : 0,
+                order.getPlacedAt(),
+                elapsed,
+                isLate
+        );
+    }
+
+    private StaffWorkloadDto toStaffWorkloadDto(KitchenStaff staff) {
+        // ✅ FIX: count only active statuses via repository query, not lazy collection
+        int active = orderRepository.countByAssignedChefAndStatusIn(
+                staff, List.of(OrderStatus.PENDING, OrderStatus.COOKING)
+        );
+        int max = staff.getMaxConcurrentOrders();
+        // ✅ FIX: cast to int, and convert UUID to String
+        int load = max > 0 ? (int) Math.round((active * 100.0) / max) : 0;
+        return new StaffWorkloadDto(
+                staff.getId().toString(), // ✅ FIX: UUID → String
+                staff.getName(),
+                active,
+                max,
+                load
+        );
+    }
+
+    private SlotCapacityDto toSlotCapacityDto(PickupSlot slot) {
+        return new SlotCapacityDto(
+                slot.getId(),
+                slot.getSlotTime(),
+                slot.getMaxCapacity(),
+                slot.getCurrentBookings(),
+                slot.getMaxCapacity() - slot.getCurrentBookings()
+        );
+    }
+}
+package com.prepline.kitchen.order.service;
+
+import com.prepline.kitchen.order.domain.Order;
+import com.prepline.kitchen.order.domain.OrderStatus;
+import com.prepline.kitchen.order.repository.OrderRepository;
+import lombok.RequiredArgsConstructor;
+import org.springframework.context.ApplicationEventPublisher;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.time.Instant;
+import java.util.UUID;
+
+@Service
+@Transactional
+@RequiredArgsConstructor
+public class OrderWorkflowService {
+
+    private final OrderRepository orderRepository;
+    private final ApplicationEventPublisher eventPublisher;
+
+    public Order transition(UUID orderId, OrderStatus targetStatus) {
+        Order order = orderRepository.findById(orderId)
+                .orElseThrow(() -> new RuntimeException("Order not found: " + orderId));
+
+        if (!order.getStatus().canTransitionTo(targetStatus)) {
+            throw new RuntimeException(
+                    "Cannot transition from " + order.getStatus() + " to " + targetStatus
+            );
+        }
+
+        stampTimestamp(order, targetStatus);
+        order.setStatus(targetStatus);
+
+        return orderRepository.save(order);
+    }
+
+    private void stampTimestamp(Order order, OrderStatus target) {
+        Instant now = Instant.now();
+        switch (target) {
+            case COOKING   -> order.setCookingStartedAt(now);
+            case READY     -> order.setReadyAt(now);
+            case COMPLETED -> order.setCompletedAt(now);
+        }
+    }
+}

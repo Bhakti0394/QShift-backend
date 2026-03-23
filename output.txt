@@ -1,0 +1,713 @@
+spring:
+  application:
+    name: prepline-auth
+
+  autoconfigure:
+    exclude: org.springframework.boot.autoconfigure.security.servlet.UserDetailsServiceAutoConfiguration
+
+  datasource:
+    url: jdbc:postgresql://localhost:5432/prepline_auth
+    username: postgres
+    password: Ambitious841_@
+    driver-class-name: org.postgresql.Driver
+
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: true
+
+  mail:
+    host: smtp.gmail.com
+    port: 587
+    username: bhaktinimaj94@gmail.com
+    password: hbharblelzozvguk
+    properties:
+      mail:
+        smtp:
+          auth: true
+          starttls:
+            enable: true
+            required: true
+          connectiontimeout: 5000
+          timeout: 5000
+          writetimeout: 5000
+    default-encoding: UTF-8
+
+# ── Kitchen KDS Configuration ─────────────────────────────────────────────────
+kitchen:
+  # Max concurrent cooking orders per chef (used as default if not set on KitchenStaff entity)
+  staff-max-concurrent-orders: 5
+
+  # PENDING queue depth = (active cooking capacity) × this multiplier
+  # With 3 chefs × 5 slots = 15 cooking capacity → 30 orders can queue before throttle
+  order-intake-buffer-multiplier: 2
+
+  # Average cook time in minutes — used for delay estimates in the removal modal
+  avg-cook-time-minutes: 7
+
+  # How often the frontend polls the board (informational — enforced in useKitchenBoard.ts)
+  board-poll-interval-seconds: 10
+package com.prepline.kitchen.order.service;
+
+import com.prepline.kitchen.order.domain.Order;
+import com.prepline.kitchen.order.domain.OrderStatus;
+import com.prepline.kitchen.order.dto.KanbanBoardResponse;
+import com.prepline.kitchen.order.dto.OrderCardDto;
+import com.prepline.kitchen.order.repository.OrderRepository;
+import com.prepline.kitchen.metrics.MetricsService;
+import com.prepline.kitchen.metrics.dto.KitchenMetricsDto;
+import com.prepline.kitchen.slot.domain.PickupSlot;
+import com.prepline.kitchen.slot.dto.SlotCapacityDto;
+import com.prepline.kitchen.slot.repository.PickupSlotRepository;
+import com.prepline.kitchen.staff.domain.KitchenStaff;
+import com.prepline.kitchen.staff.domain.KitchenStaff.StaffStatus;
+import com.prepline.kitchen.staff.dto.StaffWorkloadDto;
+import com.prepline.kitchen.staff.repository.KitchenStaffRepository;
+import lombok.RequiredArgsConstructor;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.time.Duration;
+import java.time.Instant;
+import java.time.LocalDate;
+import java.time.ZoneId;
+import java.util.*;
+import java.util.stream.Collectors;
+
+@Service
+@Transactional(readOnly = true)
+@RequiredArgsConstructor
+public class OrderQueryService {
+
+    private final OrderRepository        orderRepository;
+    private final KitchenStaffRepository staffRepository;
+    private final PickupSlotRepository   slotRepository;
+    private final MetricsService         metricsService;
+
+    // How many completed orders to include on the board (most recent first).
+    // Keeps the board payload lean — older history is available via /metrics.
+    private static final int COMPLETED_BOARD_LIMIT = 50;
+
+    public KanbanBoardResponse getBoardSnapshot() {
+        Map<OrderStatus, List<OrderCardDto>> columns = new LinkedHashMap<>();
+
+        // Active columns — no limit needed, all active orders belong on the board
+        for (OrderStatus status : List.of(
+                OrderStatus.PENDING,
+                OrderStatus.COOKING,
+                OrderStatus.READY)) {
+            columns.put(status,
+                    orderRepository.findByStatus(status)
+                            .stream()
+                            .map(this::toCardDto)
+                            .collect(Collectors.toList()));
+        }
+
+        // FIX BUG-1: COMPLETED column — load only today's completed orders, capped at
+        // COMPLETED_BOARD_LIMIT (most recent first). Previously called findByStatus(COMPLETED)
+        // which returned every order ever completed, making the board payload grow unbounded
+        // and slowing down every poll cycle.
+        Instant startOfToday = LocalDate.now(ZoneId.systemDefault())
+                .atStartOfDay(ZoneId.systemDefault())
+                .toInstant();
+
+        List<OrderCardDto> completedToday = orderRepository
+                .findByStatusAndCompletedAtAfterOrderByCompletedAtDesc(
+                        OrderStatus.COMPLETED, startOfToday)
+                .stream()
+                .limit(COMPLETED_BOARD_LIMIT)
+                .map(this::toCardDto)
+                .collect(Collectors.toList());
+
+        columns.put(OrderStatus.COMPLETED, completedToday);
+
+        List<StaffWorkloadDto> staffWorkload = staffRepository
+                .findByStatusIn(List.of(StaffStatus.ACTIVE, StaffStatus.BACKUP))
+                .stream()
+                .map(this::toStaffWorkloadDto)
+                .collect(Collectors.toList());
+
+        // FIX BUG-2: Only send FUTURE slots to the frontend — past slots are useless
+        // for new bookings and inflate the payload. Previously findAll() returned every
+        // slot ever seeded (including yesterday's, last week's, etc.).
+        Instant now = Instant.now();
+        List<SlotCapacityDto> slots = slotRepository
+                .findBySlotTimeAfter(now)          // new repo method added below
+                .stream()
+                .map(this::toSlotCapacityDto)
+                .collect(Collectors.toList());
+
+        KitchenMetricsDto metrics = metricsService.computeMetrics(LocalDate.now());
+
+        return new KanbanBoardResponse(columns, metrics, staffWorkload, slots);
+    }
+
+    private OrderCardDto toCardDto(Order order) {
+        // ── Item summary ──────────────────────────────────────────────────────
+        List<String> itemSummary = order.getItems() == null ? List.of() :
+                order.getItems().stream()
+                        .map(i -> i.getQuantity() + "x " + i.getMenuItem().getName())
+                        .collect(Collectors.toList());
+
+        // ── Chef ──────────────────────────────────────────────────────────────
+        String chefName = order.getAssignedChef() != null ? order.getAssignedChef().getName() : null;
+        UUID   chefId   = order.getAssignedChef() != null ? order.getAssignedChef().getId()   : null;
+
+        // ── Pickup slot time — full ISO-8601 instant string ───────────────────
+        String slotTime = null;
+        if (order.getPickupSlot() != null) {
+            try {
+                Instant slotInstant = order.getPickupSlot().getSlotTime()
+                        .atZone(ZoneId.systemDefault())
+                        .toInstant();
+                slotTime = slotInstant.toString();
+            } catch (Exception e) {
+                slotTime = order.getPickupSlot().getSlotTime().toString();
+            }
+        }
+
+        // ── elapsedMinutes — COOKING DURATION IN MINUTES ──────────────────────
+        // Priority order for accuracy:
+        //   1. cookingStartedAt → completedAt  (completed orders)
+        //   2. cookingStartedAt → readyAt      (ready orders)
+        //   3. cookingStartedAt → now          (currently cooking — live value)
+        //   4. 0                               (pending — not started yet)
+        int elapsedMinutes = 0;
+        Instant cookStart = order.getCookingStartedAt();
+        if (cookStart != null) {
+            Instant cookEnd =
+                    order.getCompletedAt() != null ? order.getCompletedAt() :
+                            order.getReadyAt()     != null ? order.getReadyAt()     :
+                                    order.getStatus() == OrderStatus.COOKING ? Instant.now() :
+                                            null;
+
+            if (cookEnd != null) {
+                long ms = Duration.between(cookStart, cookEnd).toMillis();
+                if (ms > 0 && ms < 8L * 60 * 60 * 1000) {
+                    elapsedMinutes = (int) (ms / 60_000);
+                }
+            }
+        }
+
+        // ── isLate — will prep finish AFTER the pickup deadline? ─────────────
+        //
+        // FIX BUG-3: The original code used anchor = cookStart ?? placedAt.
+        // For PENDING orders cookStart is always null, so anchor = placedAt.
+        // estimatedReady = placedAt + prepTime — already in the past for any
+        // order older than its prep time → isLate=true for ALL old pending orders.
+        //
+        // Correct semantics: isLate means "if we START cooking RIGHT NOW, will
+        // the order be ready before the pickup slot?" This is the actionable
+        // signal for kitchen staff (should we rush this order?).
+        //
+        // For COOKING orders: anchor = cookStart (already started).
+        // For PENDING orders: anchor = now (if we start immediately).
+        // For READY/COMPLETED: isLate = false (already done, too late to change).
+        boolean isLate = false;
+        if (order.getPickupSlot() != null
+                && order.getStatus() != OrderStatus.READY
+                && order.getStatus() != OrderStatus.COMPLETED) {
+            try {
+                Instant deadline = order.getPickupSlot().getSlotTime()
+                        .atZone(ZoneId.systemDefault()).toInstant();
+
+                // For cooking: use actual start. For pending: use NOW (urgency signal).
+                Instant anchor = (cookStart != null) ? cookStart : Instant.now();
+
+                int prepSecs = (order.getTotalPrepTimeMinutes() != null
+                        ? order.getTotalPrepTimeMinutes() : 0) * 60;
+                Instant estimatedReady = anchor.plusSeconds(prepSecs);
+
+                isLate = estimatedReady.isAfter(deadline);
+            } catch (Exception e) {
+                isLate = false;
+            }
+        }
+
+        return new OrderCardDto(
+                order.getId(),
+                order.getOrderRef(),
+                order.getStatus(),
+                itemSummary,
+                order.getCustomerName(),
+                chefName,
+                chefId != null ? chefId.toString() : null,
+                slotTime,
+                order.getTotalPrepTimeMinutes() != null ? order.getTotalPrepTimeMinutes() : 0,
+                order.getPlacedAt(),
+                order.getCookingStartedAt(),
+                order.getReadyAt(),
+                order.getCompletedAt(),
+                elapsedMinutes,
+                isLate
+        );
+    }
+
+    private StaffWorkloadDto toStaffWorkloadDto(KitchenStaff staff) {
+        int cookingLoad = orderRepository.countByAssignedChefAndStatusIn(
+                staff, List.of(OrderStatus.COOKING));
+        int active = orderRepository.countByAssignedChefAndStatusIn(
+                staff, List.of(OrderStatus.PENDING, OrderStatus.COOKING));
+        int max  = staff.getMaxConcurrentOrders();
+        int load = max > 0 ? (int) Math.round((cookingLoad * 100.0) / max) : 0;
+
+        String status;
+        if (load >= 100)     status = "full";
+        else if (load >= 50) status = "busy";
+        else                 status = "available";
+
+        Instant startOfDay = LocalDate.now(ZoneId.systemDefault())
+                .atStartOfDay(ZoneId.systemDefault())
+                .toInstant();
+        int completedToday = orderRepository.countByAssignedChefAndStatusAndCompletedAtAfter(
+                staff, OrderStatus.COMPLETED, startOfDay);
+
+        return new StaffWorkloadDto(
+                staff.getId().toString(),
+                staff.getName(),
+                active,
+                max,
+                load,
+                staff.getStatus() == StaffStatus.ACTIVE,
+                completedToday,
+                status
+        );
+    }
+
+    private SlotCapacityDto toSlotCapacityDto(PickupSlot slot) {
+        return new SlotCapacityDto(
+                slot.getId(),
+                slot.getSlotTime(),
+                slot.getMaxCapacity(),
+                slot.getCurrentBookings(),
+                slot.getMaxCapacity() - slot.getCurrentBookings()
+        );
+    }
+}
+package com.prepline.kitchen.order.repository;
+
+import com.prepline.kitchen.order.domain.Order;
+import com.prepline.kitchen.order.domain.OrderStatus;
+import com.prepline.kitchen.staff.domain.KitchenStaff;
+import jakarta.persistence.LockModeType;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Lock;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+
+import java.time.Instant;
+import java.util.List;
+import java.util.Optional;
+import java.util.UUID;
+
+public interface OrderRepository extends JpaRepository<Order, UUID> {
+
+    // ── Basic status queries ──────────────────────────────────────────────────
+
+    List<Order> findByStatus(OrderStatus status);
+
+    int countByStatus(OrderStatus status);
+
+    // ── Chef + status queries (used by StaffCapacityService + OrderQueryService) ─
+
+    List<Order> findByAssignedChefAndStatusIn(KitchenStaff chef, List<OrderStatus> statuses);
+
+    int countByAssignedChefAndStatusIn(KitchenStaff chef, List<OrderStatus> statuses);
+
+    int countByAssignedChefAndStatusAndCompletedAtAfter(
+            KitchenStaff chef, OrderStatus status, Instant after);
+
+    // ── Orphan query (used by OrderService.handleOrphanedOrders) ─────────────
+
+    List<Order> findByAssignedChefIsNullAndStatusIn(List<OrderStatus> statuses);
+
+    // ── Date-range queries (used by MetricsService) ───────────────────────────
+
+    /**
+     * All completed orders whose completedAt falls within [start, end).
+     * Used by MetricsService.computeMetrics() for avg cook time, efficiency %,
+     * and completed count for a given date.
+     */
+    @Query("SELECT o FROM Order o WHERE o.status = 'COMPLETED' " +
+            "AND o.completedAt >= :start AND o.completedAt < :end")
+    List<Order> findCompletedOnDate(@Param("start") Instant start,
+                                    @Param("end")   Instant end);
+
+    /**
+     * Count of orders placed (placedAt) within [start, end).
+     * Used by MetricsService.computeMetrics() for totalOrdersToday.
+     */
+    @Query("SELECT COUNT(o) FROM Order o WHERE o.placedAt >= :start AND o.placedAt < :end")
+    int countPlacedOnDate(@Param("start") Instant start,
+                          @Param("end")   Instant end);
+
+    // ── BUG-1 fix: today's completed orders only, most recent first ───────────
+    // Used by OrderQueryService.getBoardSnapshot() — keeps COMPLETED column
+    // payload lean (today only, caller caps at 50).
+
+    List<Order> findByStatusAndCompletedAtAfterOrderByCompletedAtDesc(
+            OrderStatus status, Instant after);
+
+    // ── Pessimistic write lock ────────────────────────────────────────────────
+    // Used by OrderService.transition() and StaffCapacityService.assignChef()
+    // to prevent optimistic locking conflicts on concurrent row updates.
+
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("SELECT o FROM Order o WHERE o.id = :id")
+    Optional<Order> findByIdWithLock(@Param("id") UUID id);
+}
+package com.prepline.kitchen.order.service;
+
+import com.prepline.kitchen.menu.domain.MenuItem;
+import com.prepline.kitchen.menu.repository.MenuItemRepository;
+import com.prepline.kitchen.order.domain.Order;
+import com.prepline.kitchen.order.domain.OrderItem;
+import com.prepline.kitchen.order.domain.OrderStatus;
+import com.prepline.kitchen.order.repository.OrderRepository;
+import com.prepline.kitchen.slot.domain.PickupSlot;
+import com.prepline.kitchen.slot.repository.PickupSlotRepository;
+import com.prepline.kitchen.staff.service.StaffCapacityService;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import jakarta.persistence.EntityManager;
+import jakarta.persistence.PersistenceContext;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.UUID;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+@Transactional
+public class OrderService {
+
+    private final OrderRepository      orderRepository;
+    private final MenuItemRepository   menuItemRepository;
+    private final StaffCapacityService staffCapacityService;
+    private final PickupSlotRepository slotRepository;
+
+    // EntityManager MUST use @PersistenceContext — Lombok @RequiredArgsConstructor
+    // cannot inject it via constructor. Using constructor injection causes Spring
+    // to fail with "No qualifying bean of type EntityManager" on startup, which
+    // silently prevents the ApplicationContext from loading → DataSeeder never runs
+    // → empty board on every restart.
+    @PersistenceContext
+    private EntityManager entityManager;
+
+    @Value("${kitchen.backup-activation-mode:SUGGEST}")
+    private String backupActivationMode;
+
+    // =========================================================================
+    // ORDER CREATION
+    // =========================================================================
+
+    public Order createOrder(String orderRef, List<UUID> menuItemIds, String customerName) {
+
+        Order order = Order.builder()
+                .orderRef(orderRef)
+                .customerName(customerName != null ? customerName : orderRef)
+                .status(OrderStatus.PENDING)
+                .placedAt(Instant.now())
+                .build();
+
+        List<OrderItem> items = new ArrayList<>();
+        int maxPrepTime = 0;
+
+        for (UUID menuItemId : menuItemIds) {
+            MenuItem menuItem = menuItemRepository.findById(menuItemId)
+                    .orElseThrow(() -> new RuntimeException("MenuItem not found: " + menuItemId));
+
+            items.add(OrderItem.builder()
+                    .order(order)
+                    .menuItem(menuItem)
+                    .quantity(1)
+                    .prepTimeMinutes(menuItem.getPrepTimeMinutes())
+                    .build());
+
+            maxPrepTime = Math.max(maxPrepTime, menuItem.getPrepTimeMinutes());
+        }
+
+        order.setItems(items);
+        order.setTotalPrepTimeMinutes(maxPrepTime);
+
+        int activeCapacity = staffCapacityService.getActiveCapacity();
+        int maxQueueDepth  = staffCapacityService.getMaxQueueDepth();
+        int currentCooking = orderRepository.countByStatus(OrderStatus.COOKING);
+        int currentPending = orderRepository.countByStatus(OrderStatus.PENDING);
+
+        if (activeCapacity == 0) {
+            log.warn("[OrderIntake] No ACTIVE staff — queuing {} without chef assignment", orderRef);
+            return orderRepository.save(order);
+        }
+
+        if (currentPending < maxQueueDepth || currentCooking < activeCapacity) {
+
+            Order saved = orderRepository.save(order);
+            log.info("[OrderIntake] {} → PENDING queue ({}/{})",
+                    orderRef, currentPending + 1, maxQueueDepth);
+
+            double queueFillRatio = (double)(currentPending + 1) / maxQueueDepth;
+            if (queueFillRatio > 0.8 && staffCapacityService.hasBackupStaff()) {
+                if ("AUTO".equalsIgnoreCase(backupActivationMode)) {
+                    boolean activated = staffCapacityService.autoActivateOneBackupChef();
+                    if (activated) {
+                        log.info("[OrderIntake] AUTO mode: activated backup chef (queue %.0f%% full)"
+                                .formatted(queueFillRatio * 100));
+                    }
+                } else {
+                    log.info("[OrderIntake] Queue at %.0f%% — backup staff available (mode={})"
+                            .formatted(queueFillRatio * 100), backupActivationMode);
+                }
+            }
+
+            return saved;
+        }
+
+        throw new SlotUnavailableException(
+                "Kitchen is at full capacity. " +
+                        "Cooking: " + currentCooking + "/" + activeCapacity + ", " +
+                        "Queue: " + currentPending + "/" + maxQueueDepth + ". " +
+                        "Please select a later pickup slot.");
+    }
+
+    public Order createOrder(String orderRef, List<UUID> menuItemIds) {
+        return createOrder(orderRef, menuItemIds, null);
+    }
+
+    // =========================================================================
+    // ORDER TRANSITIONS
+    // =========================================================================
+
+    public Order transition(UUID orderId, OrderStatus targetStatus) {
+        Order order = orderRepository.findByIdWithLock(orderId)
+                .orElseThrow(() -> new RuntimeException("Order not found: " + orderId));
+
+        if (!isValidTransition(order.getStatus(), targetStatus)) {
+            throw new IllegalStateException(
+                    "Cannot transition from " + order.getStatus() + " to " + targetStatus);
+        }
+
+        // ── CRITICAL FIX: flush + clear Hibernate L1 cache before chef check ──
+        //
+        // The frontend flow is:
+        //   1. POST /assign-chef  → chef written, transaction 1 commits
+        //   2. 400ms delay
+        //   3. PATCH /status COOKING  → this method runs in transaction 2
+        //
+        // Problem: Hibernate's L1 (first-level) cache is per-EntityManager
+        // (per-request in Spring). When findByIdWithLock() runs, Hibernate may
+        // return a cached snapshot from earlier in this same request context
+        // that predates the chef assignment commit from request 1.
+        // Result: order.getAssignedChef() == null even though the DB has a chef.
+        // We then call tryAutoAssignChef() unnecessarily, which either:
+        //   a) assigns a DIFFERENT chef than the one the user picked, or
+        //   b) fails silently → order enters COOKING with no chef → "Assign chef..."
+        //      shown in Cooking column, card appears broken/unclickable.
+        //
+        // Fix: flush any pending writes then clear the L1 cache so the next
+        // findByIdWithLock() issues a real SELECT against the DB.
+        if (targetStatus == OrderStatus.COOKING) {
+            entityManager.flush();
+            entityManager.clear();
+            // Re-read with lock — now guaranteed to see chef from transaction 1
+            order = orderRepository.findByIdWithLock(orderId)
+                    .orElseThrow(() -> new RuntimeException("Order not found: " + orderId));
+        }
+
+        if (targetStatus == OrderStatus.COOKING && order.getAssignedChef() == null) {
+            try {
+                staffCapacityService.tryAutoAssignChef(orderId);
+                entityManager.flush();
+                entityManager.clear();
+                order = orderRepository.findByIdWithLock(orderId)
+                        .orElseThrow(() -> new RuntimeException("Order not found: " + orderId));
+            } catch (RuntimeException ex) {
+                log.warn("[Transition] Auto-assign failed for order {} → COOKING without chef: {}",
+                        order.getOrderRef(), ex.getMessage());
+            }
+        }
+
+        OrderStatus previousStatus = order.getStatus();
+        stampTimestamp(order, targetStatus);
+        order.setStatus(targetStatus);
+        orderRepository.save(order);
+
+        // FIX BUG-5: promoteNextPendingOrder should only fire when an order
+        // LEAVES the cooking column (frees a cooking slot), specifically on
+        // COOKING → READY. The original fired on any previousStatus==COOKING,
+        // including COOKING→COMPLETED which already went through READY first
+        // (double-promotion) and caused spurious DB queries and race conditions.
+        //
+        // Correct trigger: COOKING → READY (a cooking slot just freed up,
+        // promote the next pending order to fill it).
+        if (previousStatus == OrderStatus.COOKING && targetStatus == OrderStatus.READY) {
+            staffCapacityService.promoteNextPendingOrder();
+        }
+
+        return order;
+    }
+
+    public void assignChef(UUID orderId, UUID chefId) {
+        staffCapacityService.assignChef(orderId, chefId);
+    }
+
+    public void handleOrphanedOrders() {
+        List<Order> unassigned = orderRepository.findByAssignedChefIsNullAndStatusIn(
+                List.of(OrderStatus.COOKING, OrderStatus.PENDING));
+
+        for (Order order : unassigned) {
+            try {
+                staffCapacityService.autoAssignChef(order.getId());
+                log.info("[Orphan] Assigned chef to order {}", order.getOrderRef());
+            } catch (RuntimeException ex) {
+                log.warn("[Orphan] Order {} still unassigned — no capacity: {}",
+                        order.getOrderRef(), ex.getMessage());
+            }
+        }
+    }
+
+    public void reserveSlot(UUID orderId, UUID slotId) {
+        PickupSlot slot = slotRepository.findById(slotId)
+                .orElseThrow(() -> new RuntimeException("Slot not found: " + slotId));
+
+        if (!slot.hasCapacity()) {
+            throw new RuntimeException("Slot at " + slot.getSlotTime() + " is fully booked");
+        }
+
+        Order order = orderRepository.findByIdWithLock(orderId)
+                .orElseThrow(() -> new RuntimeException("Order not found: " + orderId));
+
+        if (order.getPickupSlot() != null) {
+            throw new RuntimeException(
+                    "Order " + order.getOrderRef() + " already has a pickup slot reserved: " +
+                            order.getPickupSlot().getSlotTime());
+        }
+
+        slot.setCurrentBookings(slot.getCurrentBookings() + 1);
+        slotRepository.save(slot);
+
+        order.setPickupSlot(slot);
+        orderRepository.save(order);
+    }
+
+    @Transactional(readOnly = true)
+    public Order getById(UUID orderId) {
+        return orderRepository.findById(orderId)
+                .orElseThrow(() -> new RuntimeException("Order not found: " + orderId));
+    }
+
+    // =========================================================================
+    // PRIVATE HELPERS
+    // =========================================================================
+
+    private boolean isValidTransition(OrderStatus from, OrderStatus to) {
+        if (to == OrderStatus.CANCELLED) return true;
+        return switch (from) {
+            case PENDING  -> to == OrderStatus.COOKING;
+            case COOKING  -> to == OrderStatus.READY;
+            case READY    -> to == OrderStatus.COMPLETED;
+            default       -> false;
+        };
+    }
+
+    private void stampTimestamp(Order order, OrderStatus target) {
+        Instant now = Instant.now();
+        switch (target) {
+            case COOKING   -> order.setCookingStartedAt(now);
+            case READY     -> order.setReadyAt(now);
+            case COMPLETED -> order.setCompletedAt(now);
+        }
+    }
+
+    public static class SlotUnavailableException extends RuntimeException {
+        public SlotUnavailableException(String message) { super(message); }
+    }
+}
+package com.prepline.auth.security;
+
+import jakarta.servlet.FilterChain;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.http.Cookie;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.authority.SimpleGrantedAuthority;
+import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.stereotype.Component;
+import org.springframework.web.filter.OncePerRequestFilter;
+
+import java.io.IOException;
+import java.util.List;
+
+@Slf4j
+@Component
+@RequiredArgsConstructor
+public class JwtAuthFilter extends OncePerRequestFilter {
+
+    private final JwtUtil jwtUtil;
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request,
+                                    HttpServletResponse response,
+                                    FilterChain chain)
+            throws ServletException, IOException {
+        log.info("[JwtAuthFilter] Request: {} {}", request.getMethod(), request.getRequestURI());
+
+        // FIX: Try Authorization header first, then fall back to cookie.
+        // The cookie approach fails on PATCH/POST requests due to SameSite
+        // browser restrictions. Sending the token as a Bearer header is
+        // reliable for all HTTP methods.
+        String token = extractTokenFromHeader(request);
+        if (token == null) {
+            token = extractTokenFromCookie(request);
+        }
+
+        if (token != null && jwtUtil.isTokenValid(token)) {
+            try {
+                String email = jwtUtil.extractEmail(token);
+                String role  = jwtUtil.extractRole(token);
+
+                UsernamePasswordAuthenticationToken authentication =
+                        new UsernamePasswordAuthenticationToken(
+                                email,
+                                null,
+                                List.of(new SimpleGrantedAuthority("ROLE_" + role))
+                        );
+
+                SecurityContextHolder.getContext().setAuthentication(authentication);
+            } catch (Exception e) {
+                log.warn("[JwtAuthFilter] Token processing failed: {}", e.getMessage());
+                SecurityContextHolder.clearContext();
+            }
+        }
+
+        chain.doFilter(request, response);
+    }
+
+    // Reads: Authorization: Bearer <token>
+    private String extractTokenFromHeader(HttpServletRequest request) {
+        String header = request.getHeader("Authorization");
+        if (header != null && header.startsWith("Bearer ")) {
+            return header.substring(7);
+        }
+        return null;
+    }
+
+    // Fallback: reads auth_token cookie (used by /api/auth/me session check)
+    private String extractTokenFromCookie(HttpServletRequest request) {
+        if (request.getCookies() == null) return null;
+        for (Cookie cookie : request.getCookies()) {
+            if ("auth_token".equals(cookie.getName())) {
+                return cookie.getValue();
+            }
+        }
+        return null;
+    }
+}
