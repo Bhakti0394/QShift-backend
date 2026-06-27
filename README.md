@@ -1,4 +1,4 @@
-# SkipLine — Backend
+# QShift — Backend
 
 > Spring Boot REST API + SSE backend for the SkipLine pre-ordering platform. Handles JWT authentication, order lifecycle management, real-time push events, inventory deduction, slot booking, staff capacity, and kitchen metrics for any food service venue operating at scale.
 
