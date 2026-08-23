@@ -12,7 +12,6 @@
 ## Table of Contents
 
 - [What Problem Does It Solve?](#what-problem-does-it-solve)
-- [Screenshots / Demo](#screenshots--demo)
 - [Key Engineering Highlights](#key-engineering-highlights)
 - [Architecture](#architecture)
 - [Features](#features)
@@ -31,24 +30,6 @@
 Campus and office canteens lose time to physical queues, unpredictable wait times, and kitchens that can't see demand coming. QShift replaces that with **pre-ordering, pickup-slot scheduling, and live kitchen capacity balancing** — customers order ahead and get a real pickup time, while the kitchen sees a prioritized queue instead of a crowd.
 
 This repository is the backend: a single Spring Boot service exposing REST + SSE APIs consumed by two frontend roles — **Customer** and **Kitchen Staff**.
-
----
-
-## Screenshots / Demo
-
-> *Add product screenshots here — this is the single highest-impact section for anyone skimming the repo. Suggested shots:*
-> - *Customer ordering flow (menu → slot selection → confirmation)*
-> - *Live order tracking screen (SSE status updates in real time)*
-> - *Kitchen kanban board (PENDING → COOKING → READY columns)*
-> - *Staff capacity / workload dashboard*
->
-> *A 20–30 second screen recording (GIF or embedded video link) of an order moving through the kitchen board in real time would be the strongest single asset in this README.*
-
-<p align="center">
-  <img src="docs/screenshots/customer-order-flow.png" width="32%" alt="Customer ordering flow" />
-  <img src="docs/screenshots/kitchen-kanban-board.png" width="32%" alt="Kitchen kanban board" />
-  <img src="docs/screenshots/live-order-tracking.png" width="32%" alt="Live order tracking via SSE" />
-</p>
 
 ---
 
