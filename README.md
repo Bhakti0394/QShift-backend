@@ -428,8 +428,6 @@ kitchen:
   backup-activation-mode: ${BACKUP_MODE:SUGGEST}   # SUGGEST or AUTO
 ```
 
-> ⚠️ Generate your own JWT secret (32+ random characters) and Gmail App Password — never reuse example values, and never commit a populated `application.yaml` or `.env` file.
-
 ---
 
 ## Detailed Documentation
@@ -639,8 +637,6 @@ Note: `CustomerOrderDto.status` is serialised as lowercase via `order.getStatus(
 | Repository | Description |
 |---|---|
 | [QShift-frontend](https://github.com/Bhakti0394/QShift-frontend) | React + TypeScript frontend — customer and kitchen dashboards |
-
-> Note: verify these repo names/URLs match your actual GitHub repos before publishing — standardize on either `QShift` or `QLess` across both repos, not a mix of both.
 
 ---
 
