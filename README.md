@@ -29,6 +29,8 @@
 
 Campus and office canteens lose time to physical queues, unpredictable wait times, and kitchens that can't see demand coming. QShift replaces that with **pre-ordering, pickup-slot scheduling, and live kitchen capacity balancing** — customers order ahead and get a real pickup time, while the kitchen sees a prioritized queue instead of a crowd.
 
+It also cuts a cost most kitchens absorb quietly: food waste. When a kitchen has to guess at demand to stay ahead of a queue, it over-prepares, and unsold food gets thrown out. Because every order here is placed and confirmed before cooking starts, the kitchen prepares exactly what's been ordered — nothing more.
+
 This repository is the backend: a single Spring Boot service exposing REST + SSE APIs consumed by two frontend roles — **Customer** and **Kitchen Staff**.
 
 ---
