@@ -1,6 +1,6 @@
 # QShift — Backend
 
-> Spring Boot REST API + SSE backend for the SkipLine pre-ordering platform. Handles JWT authentication, order lifecycle management, real-time push events, inventory deduction, slot booking, staff capacity, and kitchen metrics for any food service venue operating at scale.
+> Spring Boot REST API + SSE backend for the QShift pre-ordering platform. Handles JWT authentication, order lifecycle management, real-time push events, inventory deduction, slot booking, staff capacity, and kitchen metrics for any food service venue operating at scale.
 
 [![Java](https://img.shields.io/badge/Java-17-ED8B00?logo=openjdk&logoColor=white)](https://openjdk.org)
 [![Spring Boot](https://img.shields.io/badge/Spring_Boot-3-6DB33F?logo=springboot&logoColor=white)](https://spring.io/projects/spring-boot)
@@ -11,48 +11,148 @@
 
 ## Table of Contents
 
-- [Overview](#overview)
-- [Module Structure](#module-structure)
+- [What Problem Does It Solve?](#what-problem-does-it-solve)
+- [Screenshots / Demo](#screenshots--demo)
+- [Key Engineering Highlights](#key-engineering-highlights)
+- [Architecture](#architecture)
 - [Features](#features)
 - [Tech Stack](#tech-stack)
-- [Project Structure](#project-structure)
-- [Getting Started](#getting-started)
-- [Environment Variables](#environment-variables)
 - [API Reference](#api-reference)
-- [Architecture](#architecture)
 - [Database Schema](#database-schema)
-- [Data Seeding](#data-seeding)
-- [Real-time Events (SSE)](#real-time-events-sse)
-- [Bug Fixes & Engineering Decisions](#bug-fixes--engineering-decisions)
+- [Engineering Challenges & Solutions](#engineering-challenges--solutions)
+- [Setup](#setup)
+- [Detailed Documentation](#detailed-documentation)
 - [Related Repositories](#related-repositories)
 
 ---
 
-## Overview
+## What Problem Does It Solve?
 
-This is the backend service for SkipLine. It exposes a REST API consumed by two frontend roles — Customer and Kitchen Staff — and pushes real-time order status updates via Server-Sent Events.
+Campus and office canteens lose time to physical queues, unpredictable wait times, and kitchens that can't see demand coming. QShift replaces that with **pre-ordering, pickup-slot scheduling, and live kitchen capacity balancing** — customers order ahead and get a real pickup time, while the kitchen sees a prioritized queue instead of a crowd.
 
-The service is a single Spring Boot application with two logical modules under one deployment:
-
-- **`com.prepline.auth`** — Customer registration, login, JWT issuance; Admin OTP-based login
-- **`com.prepline.kitchen`** — Order management, menu, inventory, staff, pickup slots, metrics, SSE
+This repository is the backend: a single Spring Boot service exposing REST + SSE APIs consumed by two frontend roles — **Customer** and **Kitchen Staff**.
 
 ---
 
-## Module Structure
+## Screenshots / Demo
+
+> *Add product screenshots here — this is the single highest-impact section for anyone skimming the repo. Suggested shots:*
+> - *Customer ordering flow (menu → slot selection → confirmation)*
+> - *Live order tracking screen (SSE status updates in real time)*
+> - *Kitchen kanban board (PENDING → COOKING → READY columns)*
+> - *Staff capacity / workload dashboard*
+>
+> *A 20–30 second screen recording (GIF or embedded video link) of an order moving through the kitchen board in real time would be the strongest single asset in this README.*
+
+<p align="center">
+  <img src="docs/screenshots/customer-order-flow.png" width="32%" alt="Customer ordering flow" />
+  <img src="docs/screenshots/kitchen-kanban-board.png" width="32%" alt="Kitchen kanban board" />
+  <img src="docs/screenshots/live-order-tracking.png" width="32%" alt="Live order tracking via SSE" />
+</p>
+
+---
+
+## Key Engineering Highlights
+
+This isn't a CRUD-with-login project — the parts below are what separate it from a tutorial build:
+
+| Highlight | Why it matters |
+|---|---|
+| 🔐 **JWT Auth + Role-Based Access** | Stateless sessions; `CUSTOMER` and `KITCHEN` roles enforced at the route level, with a separate OTP-based flow for admin login |
+| ⚡ **Real-Time Order Updates (SSE)** | Customers see status changes the instant the kitchen updates them — no polling required, with a 15s-polling fallback if the stream drops |
+| 🔄 **Order Lifecycle State Machine** | Strict `PENDING → COOKING → READY → COMPLETED` transitions with cancellation and rollback paths, all timestamped |
+| 🔒 **Pessimistic Locking & Deadlock Resolution** | Found and fixed a real database deadlock caused by duplicate row-level locks under concurrent order promotion — see [Engineering Challenges](#engineering-challenges--solutions) |
+| 📦 **Recipe-Linked Inventory Deduction** | Stock is deducted per dish based on an ingredient-mapping table the moment an order starts cooking, failing non-fatally so a stock hiccup never blocks the kitchen |
+| 🧠 **Capacity-Based Auto-Assignment** | Orders are auto-routed to the least-loaded active chef; backup staff are auto-suggested once the queue crosses 80% of active capacity |
+| 🕒 **Timezone-Correct Metrics** | All kitchen analytics compute against `Asia/Kolkata`, fixing a bug where metrics silently read zero for the first 5.5 hours of every day |
+
+---
+
+## Architecture
+
+```mermaid
+flowchart TB
+    subgraph Clients
+        CUST[Customer Web App]
+        KITCH[Kitchen Dashboard]
+    end
+
+    CUST -- "REST + SSE" --> API
+    KITCH -- "REST" --> API
+
+    subgraph API["Spring Boot API"]
+        JWT[JWT Auth Filter]
+        ORD[Order Service]
+        INV[Inventory Service]
+        STAFF[Staff Capacity Service]
+        MET[Metrics Service]
+    end
+
+    JWT --> ORD
+    JWT --> INV
+    JWT --> STAFF
+    JWT --> MET
+
+    ORD --> DB[(PostgreSQL)]
+    INV --> DB
+    STAFF --> DB
+    MET --> DB
+
+    ORD -- "SSE push on status change" --> CUST
+```
+
+### Request Flow
 
 ```
-com.prepline/
-├── auth/          Customer and admin authentication
-└── kitchen/
-    ├── config/    Data seeding (runs on every boot)
-    ├── inventory/ Stock management and recipe-based deduction
-    ├── menu/      Menu items and ingredient recipe mappings
-    ├── metrics/   Kitchen analytics computation
-    ├── order/     Order lifecycle, status transitions, SSE push, customer endpoints
-    ├── slot/      Pickup slot domain and repository
-    └── staff/     Chef management, workload tracking, auto-assignment
+HTTP Request
+  └── CorsFilter
+        └── JwtAuthFilter
+              ├── Reads Authorization header (Bearer token)
+              │   OR ?token= query param (for SSE)
+              ├── Validates JWT via JwtUtil
+              ├── Populates SecurityContextHolder
+              └── Spring Security AuthorizationFilter
+                    ├── /api/customer/sse/** → permitAll() (JwtAuthFilter already validated)
+                    ├── /api/customer/**    → hasRole("CUSTOMER")
+                    ├── /api/kitchen/**     → hasRole("KITCHEN")
+                    └── Controller
 ```
+
+### Order Creation Flow
+
+```
+POST /api/customer/orders
+  └── OrderService.createOrder(orderRef, menuItemIds, email, pickupSlotId)
+        ├── Validates pickupSlotId exists and has remaining capacity
+        ├── Validates each menuItemId exists in MenuItem table
+        ├── Builds Order + OrderItems, sets totalPrepTimeMinutes = max(item prep times)
+        ├── Links and books the pickup slot (currentBookings + 1)
+        ├── Checks kitchen capacity: (currentPending < maxQueueDepth OR currentCooking < capacity)
+        │     └── If over capacity → rollback slot booking → throw SlotUnavailableException
+        ├── Checks queue fill ratio > 80% → logs backup staff suggestion (or auto-activates in AUTO mode)
+        └── Saves order → returns CustomerOrderDto
+```
+
+### Status Transition Flow
+
+```
+PATCH /api/kitchen/orders/:id/status  { targetStatus: "COOKING" }
+  └── OrderService.transition(orderId, COOKING)
+        ├── Validates PENDING → COOKING is a legal transition
+        ├── Checks chef assignment
+        │     └── If no chef → tries autoAssignChef (picks least-loaded ACTIVE chef)
+        │           └── If still no chef → throws (manual assignment required)
+        ├── deductInventoryForOrder(order) — non-fatal, logs warning on failure
+        ├── Stamps cookingStartedAt = Instant.now()
+        ├── Saves order with new status
+        └── CustomerSseController.pushStatusUpdate(orderId, COOKING) → customer stream
+```
+
+### Deadlock Elimination in `promoteNextPendingOrder`
+
+The simulation advance path previously had a deadlock: `promoteNextPendingOrder` ran in `REQUIRES_NEW`, acquired a `SELECT FOR UPDATE` on the candidate order, then called `autoAssignChef(orderId)` which tried to acquire a second `SELECT FOR UPDATE` on the same row. Two concurrent simulation ticks on the same candidate order caused a DB-level deadlock.
+
+Fix: `promoteNextPendingOrder` now locks the order row once with `findByIdWithLock`, then calls `assignChefToOrder(order)` — passing the already-locked entity directly. `assignChefToOrder` only locks the chef row, never the order row again. Zero duplicate lock acquisitions.
 
 ---
 
@@ -191,13 +291,194 @@ PENDING → COOKING → READY → COMPLETED
 
 ---
 
-## Project Structure
+## API Reference
+
+### Auth
+
+| Method | Endpoint | Auth | Description |
+|---|---|---|---|
+| `POST` | `/api/auth/register` | Public | Register customer — `{ fullName, email, password }` |
+| `POST` | `/api/auth/login` | Public | Login — returns `{ token, role, email, fullName }` |
+| `POST` | `/api/auth/logout` | Bearer | Invalidate session (client clears token) |
+| `POST` | `/api/admin/auth/send-otp` | Public | Send OTP to admin email |
+| `POST` | `/api/admin/auth/verify-otp` | Public | Verify OTP — returns admin JWT |
+
+### Customer
+
+| Method | Endpoint | Auth | Description |
+|---|---|---|---|
+| `GET` | `/api/customer/menu-items` | Public | All available menu items |
+| `POST` | `/api/customer/orders` | Customer | Place order (Normal / Express / Scheduled) |
+| `GET` | `/api/customer/orders` | Customer | All orders for the authenticated customer |
+| `GET` | `/api/customer/orders/:id` | Customer | Single order (ownership verified) |
+| `GET` | `/api/customer/metrics` | Customer | `ordersThisMonth`, `timeSaved`, `loyaltyPoints`, `foodWasteReduced` |
+| `GET` | `/api/customer/streak` | Customer | `{ streak: N }` — consecutive daily order count |
+| `GET` | `/api/customer/kitchen-summary` | Customer | Top dish, busiest hour, avg prep, bottleneck flag |
+| `GET` | `/api/customer/slots` | Customer | Today's available pickup slots (future only) |
+| `GET` | `/api/customer/slots/tomorrow` | Customer | Tomorrow's pickup slots grouped by period |
+| `GET` | `/api/customer/addons` | Customer | Available add-ons for order customisation |
+| `GET` | `/api/customer/stats` | Public | `totalOrdersDelivered`, `totalCustomers`, `totalMenuItems`, `avgRating` |
+| `GET` | `/api/customer/sse/orders/:id/stream` | JWT via `?token=` | SSE stream for order status updates |
+
+### Kitchen
+
+| Method | Endpoint | Auth | Description |
+|---|---|---|---|
+| `GET` | `/api/kitchen/board` | Kitchen | Full kanban board: orders + metrics + staff + slots |
+| `GET` | `/api/kitchen/menu-items` | Kitchen | All available menu items |
+| `POST` | `/api/kitchen/orders` | Kitchen | Create order (simulation) |
+| `PATCH` | `/api/kitchen/orders/:id/status` | Kitchen | Transition to `COOKING`, `READY`, `COMPLETED`, or `CANCELLED` |
+| `PATCH` | `/api/kitchen/orders/:id/assign-chef` | Kitchen | Assign chef to order |
+| `PATCH` | `/api/kitchen/orders/:id/reserve-slot` | Kitchen | Book a pickup slot for an existing order |
+| `POST` | `/api/kitchen/simulate-advance` | Kitchen | Promote PENDING → COOKING (express-first priority) |
+| `GET` | `/api/kitchen/metrics` | Kitchen | Analytics for `?date=YYYY-MM-DD` (defaults to today) |
+| `GET` | `/api/kitchen/server-time` | Kitchen | `{ serverTimeMs }` for frontend clock sync |
+| `GET` | `/api/kitchen/staff` | Kitchen | All ACTIVE and BACKUP staff with workload |
+| `POST` | `/api/kitchen/staff` | Kitchen | Add new staff member |
+| `PATCH` | `/api/kitchen/staff/:id/activate` | Kitchen | Set status to ACTIVE |
+| `PATCH` | `/api/kitchen/staff/:id/remove-from-shift` | Kitchen | Set status to BACKUP |
+| `GET` | `/api/kitchen/staff/:id/validate-removal` | Kitchen | Safety check before removing chef |
+| `GET` | `/api/kitchen/inventory` | Kitchen | All inventory items with stock status |
+| `PATCH` | `/api/kitchen/inventory/:id/stock` | Kitchen | Set absolute stock level |
+| `PATCH` | `/api/kitchen/inventory/:id/restock` | Kitchen | Add quantity to current stock |
+| `DELETE` | `/api/kitchen/inventory/:id` | Kitchen | Remove inventory item |
+
+---
+
+## Database Schema
+
+### Core Tables
+
+| Table | Key Columns |
+|---|---|
+| `customers` | `id`, `email` (unique), `password` (BCrypt), `full_name`, `active` |
+| `admins` | `id`, `email` (unique), `organisation`, `kitchen_name`, `active` |
+| `admin_otps` | `id`, `email`, `otp`, `expiry_time`, `used` |
+| `menu_items` | `id` (UUID), `name`, `prep_time_minutes`, `price`, `category`, `is_express`, `available` |
+| `menu_item_recipes` | `id`, `menu_item_id` (FK), `inventory_item_id`, `inventory_item_name`, `quantity` |
+| `orders` | `id` (UUID), `order_ref`, `customer_name`, `status`, `assigned_chef_id` (FK), `pickup_slot_id` (FK), `total_prep_time_minutes`, `placed_at`, `cooking_started_at`, `ready_at`, `completed_at`, `version` |
+| `order_items` | `id`, `order_id` (FK), `menu_item_id` (FK), `quantity`, `prep_time_minutes` |
+| `pickup_slots` | `id` (UUID), `slot_time` (LocalDateTime IST), `max_capacity`, `current_bookings` |
+| `inventory_items` | `id`, `name`, `category`, `current_stock`, `max_capacity`, `unit`, `min_threshold`, `critical_threshold`, `cost_per_unit`, `supplier`, `last_restocked` |
+| `kitchen_staff` | `id` (UUID), `name`, `max_concurrent_orders`, `status` (ACTIVE/BACKUP) |
+
+### Indexes
+
+`orders` has explicit indexes on `status` and `placed_at`:
+- `idx_orders_status` — `findByStatus()` is called on every board poll (every 10s) and on every transition
+- `idx_orders_placed_at` — used for `simulate-advance` sort and `completed-today` queries
+
+---
+
+## Engineering Challenges & Solutions
+
+| Area | Problem | Fix |
+|---|---|---|
+| SSE always returned 401 | Spring Security evaluated `/api/customer/sse/**` against `hasRole("CUSTOMER")` before `JwtAuthFilter` ran. SecurityContext was empty at match time → 401 before `?token=` could be read | Added `requestMatchers("/api/customer/sse/**").permitAll()` **before** the `/api/customer/**` wildcard in `SecurityConfig`. Spring Security stops at first match — SSE path bypasses role check, `JwtAuthFilter` still validates the token |
+| Customer orders not found | `JwtAuthFilter` stores email as the JWT subject/principal. Orders were looked up by `customerName` which sometimes stored the display name instead of email → no orders found | `getOrdersForCustomer(email)` now does a primary lookup by email + a fallback search by email local-part to catch legacy orders stored before the fix |
+| Order ownership bypass | `getOrderForCustomer` had no ownership check — any authenticated customer could fetch any order by UUID | Added ownership check: stored `customerName` must match the requesting email or its local-part |
+| Slot booking not dropped on full-capacity rejection | When the kitchen was full, `createOrder` threw but the slot `currentBookings` had already been incremented → slot capacity permanently leaked | Added rollback: decrement `currentBookings` on the slot before throwing `SlotUnavailableException` |
+| `pickupSlotId` dropped on kitchen-side order creation | `OrderController.createOrder()` called the 3-arg `createOrder` overload — `pickupSlotId` from `CreateOrderRequest` was silently ignored for all simulation orders | Changed to call the 4-arg overload, passing `request.pickupSlotId()` |
+| Metrics always showed 0 all day | `MetricsService` used `Instant.now().atZone(ZoneId.systemDefault())` which was UTC midnight (05:30 IST) — no orders were "today" until 05:30 | Changed to `ZoneId.of("Asia/Kolkata")` — `startOfDay` is now midnight IST |
+| Board payload included all historical slots | `getBoardSnapshot()` called `findAll()` on slots — returned every slot ever seeded, including past ones. Frontend had to filter client-side; stale data inflated the payload on every 10s poll | Changed to `findBySlotTimeAfterOrderBySlotTimeAsc(now)` — only future slots returned |
+| Deadlock in simulation | `promoteNextPendingOrder` (REQUIRES_NEW) locked an order row, then called `autoAssignChef(orderId)` which called `findByIdWithLock` on the same row. Two concurrent ticks → DB deadlock | `promoteNextPendingOrder` now passes the already-locked `Order` entity directly to `assignChefToOrder()`. `assignChefToOrder` only locks the chef row — zero duplicate order row locks |
+| `OrderStatus.java` not serialised as lowercase | `CustomerOrderDto` used `order.getStatus()` directly → serialised as uppercase `"PENDING"`. Frontend `statusMap` looked up lowercase keys → always fell through to default | `CustomerOrderDto.from()` calls `order.getStatus().name().toLowerCase()` |
+| `totalPrice` missing from customer response | `CustomerOrderDto` had no `totalPrice` field → `OrderHistory` always showed "—" | Added `totalPrice` computed as `sum(menuItem.price × quantity)` for all order items |
+| `Order` entity missing DB indexes | `findByStatus()` called on every 10s board poll — full table scan at scale | Added `@Index` on `status` and `placed_at` columns |
+
+---
+
+## Setup
+
+### Prerequisites
+
+- Java 17+
+- Maven 3.8+
+- PostgreSQL 15 running locally
+
+### Installation
+
+```bash
+git clone https://github.com/Bhakti0394/QShift-backend.git
+cd QShift-backend
+
+# Configure application.yaml (see Environment Variables below)
+
+./mvnw spring-boot:run
+```
+
+On first boot, `DataSeeder` automatically seeds:
+- 4 kitchen staff members (3 ACTIVE + 1 BACKUP)
+- 21 menu items across 8 categories
+- 27 inventory items across 6 categories
+- Recipe ingredient mappings for 6 dishes
+- 12 pickup slots (8 today + 4 tomorrow)
+- 10 demo orders in various states
+
+API available at `http://localhost:8080`
+
+### Build
+
+```bash
+./mvnw clean package
+java -jar target/qshift-auth-*.jar
+```
+
+### Environment Variables
+
+`src/main/resources/application.yaml` reads from environment variables — **no real credentials are committed to this repo.** Set your own values via environment variables or a local `.env` file that's excluded in `.gitignore`:
+
+```yaml
+spring:
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/prepline_auth}
+    username: ${DB_USERNAME:your_db_username}
+    password: ${DB_PASSWORD:your_db_password}
+
+  mail:
+    username: ${GMAIL_USERNAME:your_email@gmail.com}
+    password: ${GMAIL_APP_PASSWORD:your_gmail_app_password}
+
+jwt:
+  secret: ${JWT_SECRET:replace_with_a_random_32_plus_char_secret}
+  expiration: ${JWT_EXPIRATION_MS:86400000}   # 24 hours
+
+kitchen:
+  backup-activation-mode: ${BACKUP_MODE:SUGGEST}   # SUGGEST or AUTO
+```
+
+> ⚠️ Generate your own JWT secret (32+ random characters) and Gmail App Password — never reuse example values, and never commit a populated `application.yaml` or `.env` file.
+
+---
+
+## Detailed Documentation
+
+<details>
+<summary><strong>Module Structure</strong></summary>
 
 ```
-src/main/java/com/prepline/
+com.qshift/
+├── auth/          Customer and admin authentication
+└── kitchen/
+    ├── config/    Data seeding (runs on every boot)
+    ├── inventory/ Stock management and recipe-based deduction
+    ├── menu/      Menu items and ingredient recipe mappings
+    ├── metrics/   Kitchen analytics computation
+    ├── order/     Order lifecycle, status transitions, SSE push, customer endpoints
+    ├── slot/      Pickup slot domain and repository
+    └── staff/     Chef management, workload tracking, auto-assignment
+```
+
+</details>
+
+<details>
+<summary><strong>Project Structure</strong></summary>
+
+```
+src/main/java/com/qshift/
 │
 ├── auth/
-│   ├── PreplineAuthApplication.java       # Spring Boot entry point
+│   ├── QShiftAuthApplication.java       # Spring Boot entry point
 │   ├── controller/
 │   │   └── AuthController.java            # POST /api/auth/login, /register, /logout
 │   │                                      # POST /api/admin/auth/send-otp, /verify-otp
@@ -297,210 +578,10 @@ src/main/java/com/prepline/
             └── MetricsProjectionRepository.java
 ```
 
----
+</details>
 
-## Getting Started
-
-### Prerequisites
-
-- Java 17+
-- Maven 3.8+
-- PostgreSQL 15 running locally
-
-### Setup
-
-```bash
-git clone https://github.com/Bhakti0394/QLess-backend.git
-cd QLess-backend
-
-# Configure application.yaml (see Environment Variables)
-
-./mvnw spring-boot:run
-```
-
-On first boot, `DataSeeder` automatically seeds:
-- 4 kitchen staff members (3 ACTIVE + 1 BACKUP)
-- 21 menu items across 8 categories
-- 27 inventory items across 6 categories
-- Recipe ingredient mappings for 6 dishes
-- 12 pickup slots (8 today + 4 tomorrow)
-- 10 demo orders in various states
-
-API available at `http://localhost:8080`
-
-### Build
-
-```bash
-./mvnw clean package
-java -jar target/prepline-auth-*.jar
-```
-
----
-
-## Environment Variables
-
-`src/main/resources/application.yaml` reads from environment variables with local defaults:
-
-```yaml
-spring:
-  datasource:
-    url: ${DB_URL:jdbc:postgresql://localhost:5432/prepline_auth}
-    username: ${DB_USERNAME:postgres}
-    password: ${DB_PASSWORD:postgres123}
-
-  mail:
-    username: ${GMAIL_USERNAME:dev@gmail.com}
-    password: ${GMAIL_APP_PASSWORD:dev-password}
-
-jwt:
-  secret: ${JWT_SECRET:prepline-local-dev-secret-key-minimum-32chars}
-  expiration: ${JWT_EXPIRATION_MS:86400000}   # 24 hours
-
-kitchen:
-  backup-activation-mode: ${BACKUP_MODE:SUGGEST}   # SUGGEST or AUTO
-```
-
-For production, set these as environment variables or in a `.env` file — never commit real credentials.
-
----
-
-## API Reference
-
-### Auth
-
-| Method | Endpoint | Auth | Description |
-|---|---|---|---|
-| `POST` | `/api/auth/register` | Public | Register customer — `{ fullName, email, password }` |
-| `POST` | `/api/auth/login` | Public | Login — returns `{ token, role, email, fullName }` |
-| `POST` | `/api/auth/logout` | Bearer | Invalidate session (client clears token) |
-| `POST` | `/api/admin/auth/send-otp` | Public | Send OTP to admin email |
-| `POST` | `/api/admin/auth/verify-otp` | Public | Verify OTP — returns admin JWT |
-
-### Customer
-
-| Method | Endpoint | Auth | Description |
-|---|---|---|---|
-| `GET` | `/api/customer/menu-items` | Public | All available menu items |
-| `POST` | `/api/customer/orders` | Customer | Place order (Normal / Express / Scheduled) |
-| `GET` | `/api/customer/orders` | Customer | All orders for the authenticated customer |
-| `GET` | `/api/customer/orders/:id` | Customer | Single order (ownership verified) |
-| `GET` | `/api/customer/metrics` | Customer | `ordersThisMonth`, `timeSaved`, `loyaltyPoints`, `foodWasteReduced` |
-| `GET` | `/api/customer/streak` | Customer | `{ streak: N }` — consecutive daily order count |
-| `GET` | `/api/customer/kitchen-summary` | Customer | Top dish, busiest hour, avg prep, bottleneck flag |
-| `GET` | `/api/customer/slots` | Customer | Today's available pickup slots (future only) |
-| `GET` | `/api/customer/slots/tomorrow` | Customer | Tomorrow's pickup slots grouped by period |
-| `GET` | `/api/customer/addons` | Customer | Available add-ons for order customisation |
-| `GET` | `/api/customer/stats` | Public | `totalOrdersDelivered`, `totalCustomers`, `totalMenuItems`, `avgRating` |
-| `GET` | `/api/customer/sse/orders/:id/stream` | JWT via `?token=` | SSE stream for order status updates |
-
-### Kitchen
-
-| Method | Endpoint | Auth | Description |
-|---|---|---|---|
-| `GET` | `/api/kitchen/board` | Kitchen | Full kanban board: orders + metrics + staff + slots |
-| `GET` | `/api/kitchen/menu-items` | Kitchen | All available menu items |
-| `POST` | `/api/kitchen/orders` | Kitchen | Create order (simulation) |
-| `PATCH` | `/api/kitchen/orders/:id/status` | Kitchen | Transition to `COOKING`, `READY`, `COMPLETED`, or `CANCELLED` |
-| `PATCH` | `/api/kitchen/orders/:id/assign-chef` | Kitchen | Assign chef to order |
-| `PATCH` | `/api/kitchen/orders/:id/reserve-slot` | Kitchen | Book a pickup slot for an existing order |
-| `POST` | `/api/kitchen/simulate-advance` | Kitchen | Promote PENDING → COOKING (express-first priority) |
-| `GET` | `/api/kitchen/metrics` | Kitchen | Analytics for `?date=YYYY-MM-DD` (defaults to today) |
-| `GET` | `/api/kitchen/server-time` | Kitchen | `{ serverTimeMs }` for frontend clock sync |
-| `GET` | `/api/kitchen/staff` | Kitchen | All ACTIVE and BACKUP staff with workload |
-| `POST` | `/api/kitchen/staff` | Kitchen | Add new staff member |
-| `PATCH` | `/api/kitchen/staff/:id/activate` | Kitchen | Set status to ACTIVE |
-| `PATCH` | `/api/kitchen/staff/:id/remove-from-shift` | Kitchen | Set status to BACKUP |
-| `GET` | `/api/kitchen/staff/:id/validate-removal` | Kitchen | Safety check before removing chef |
-| `GET` | `/api/kitchen/inventory` | Kitchen | All inventory items with stock status |
-| `PATCH` | `/api/kitchen/inventory/:id/stock` | Kitchen | Set absolute stock level |
-| `PATCH` | `/api/kitchen/inventory/:id/restock` | Kitchen | Add quantity to current stock |
-| `DELETE` | `/api/kitchen/inventory/:id` | Kitchen | Remove inventory item |
-
----
-
-## Architecture
-
-### Request Flow
-
-```
-HTTP Request
-  └── CorsFilter
-        └── JwtAuthFilter
-              ├── Reads Authorization header (Bearer token)
-              │   OR ?token= query param (for SSE)
-              ├── Validates JWT via JwtUtil
-              ├── Populates SecurityContextHolder
-              └── Spring Security AuthorizationFilter
-                    ├── /api/customer/sse/** → permitAll() (JwtAuthFilter already validated)
-                    ├── /api/customer/**    → hasRole("CUSTOMER")
-                    ├── /api/kitchen/**     → hasRole("KITCHEN")
-                    └── Controller
-```
-
-### Order Creation Flow
-
-```
-POST /api/customer/orders
-  └── OrderService.createOrder(orderRef, menuItemIds, email, pickupSlotId)
-        ├── Validates pickupSlotId exists and has remaining capacity
-        ├── Validates each menuItemId exists in MenuItem table
-        ├── Builds Order + OrderItems, sets totalPrepTimeMinutes = max(item prep times)
-        ├── Links and books the pickup slot (currentBookings + 1)
-        ├── Checks kitchen capacity: (currentPending < maxQueueDepth OR currentCooking < capacity)
-        │     └── If over capacity → rollback slot booking → throw SlotUnavailableException
-        ├── Checks queue fill ratio > 80% → logs backup staff suggestion (or auto-activates in AUTO mode)
-        └── Saves order → returns CustomerOrderDto
-```
-
-### Status Transition Flow
-
-```
-PATCH /api/kitchen/orders/:id/status  { targetStatus: "COOKING" }
-  └── OrderService.transition(orderId, COOKING)
-        ├── Validates PENDING → COOKING is a legal transition
-        ├── Checks chef assignment
-        │     └── If no chef → tries autoAssignChef (picks least-loaded ACTIVE chef)
-        │           └── If still no chef → throws (manual assignment required)
-        ├── deductInventoryForOrder(order) — non-fatal, logs warning on failure
-        ├── Stamps cookingStartedAt = Instant.now()
-        ├── Saves order with new status
-        └── CustomerSseController.pushStatusUpdate(orderId, COOKING) → customer stream
-```
-
-### Deadlock Elimination in `promoteNextPendingOrder`
-
-The simulation advance path previously had a deadlock: `promoteNextPendingOrder` ran in `REQUIRES_NEW`, acquired a `SELECT FOR UPDATE` on the candidate order, then called `autoAssignChef(orderId)` which tried to acquire a second `SELECT FOR UPDATE` on the same row. Two concurrent simulation ticks on the same candidate order caused a DB-level deadlock.
-
-Fix: `promoteNextPendingOrder` now locks the order row once with `findByIdWithLock`, then calls `assignChefToOrder(order)` — passing the already-locked entity directly. `assignChefToOrder` only locks the chef row, never the order row again. Zero duplicate lock acquisitions.
-
----
-
-## Database Schema
-
-### Core Tables
-
-| Table | Key Columns |
-|---|---|
-| `customers` | `id`, `email` (unique), `password` (BCrypt), `full_name`, `active` |
-| `admins` | `id`, `email` (unique), `organisation`, `kitchen_name`, `active` |
-| `admin_otps` | `id`, `email`, `otp`, `expiry_time`, `used` |
-| `menu_items` | `id` (UUID), `name`, `prep_time_minutes`, `price`, `category`, `is_express`, `available` |
-| `menu_item_recipes` | `id`, `menu_item_id` (FK), `inventory_item_id`, `inventory_item_name`, `quantity` |
-| `orders` | `id` (UUID), `order_ref`, `customer_name`, `status`, `assigned_chef_id` (FK), `pickup_slot_id` (FK), `total_prep_time_minutes`, `placed_at`, `cooking_started_at`, `ready_at`, `completed_at`, `version` |
-| `order_items` | `id`, `order_id` (FK), `menu_item_id` (FK), `quantity`, `prep_time_minutes` |
-| `pickup_slots` | `id` (UUID), `slot_time` (LocalDateTime IST), `max_capacity`, `current_bookings` |
-| `inventory_items` | `id`, `name`, `category`, `current_stock`, `max_capacity`, `unit`, `min_threshold`, `critical_threshold`, `cost_per_unit`, `supplier`, `last_restocked` |
-| `kitchen_staff` | `id` (UUID), `name`, `max_concurrent_orders`, `status` (ACTIVE/BACKUP) |
-
-### Indexes
-
-`orders` has explicit indexes on `status` and `placed_at`:
-- `idx_orders_status` — `findByStatus()` is called on every board poll (every 10s) and on every transition
-- `idx_orders_placed_at` — used for `simulate-advance` sort and `completed-today` queries
-
----
-
-## Data Seeding
+<details>
+<summary><strong>Data Seeding</strong></summary>
 
 `DataSeeder` runs on every boot and is idempotent for most entities.
 
@@ -531,11 +612,12 @@ Fix: `promoteNextPendingOrder` now locks the order row once with `findByIdWithLo
 | Prawn Masala | Prawns, Tomato, Onion, Ginger, Garam Masala, Tamarind Paste |
 | Vada Pav | Tomato, Mint Chutney, Coriander Leaves |
 
----
+</details>
 
-## Real-time Events (SSE)
+<details>
+<summary><strong>Real-time Events (SSE)</strong></summary>
 
-### Connection
+**Connection**
 
 ```
 GET /api/customer/sse/orders/{orderId}/stream?token=<jwt>
@@ -545,7 +627,7 @@ GET /api/customer/sse/orders/{orderId}/stream?token=<jwt>
 - `CustomerSseController` registers an `SseEmitter` for this `orderId`
 - Connection stays open until the order reaches a terminal state or the client disconnects
 
-### Event Payload
+**Event Payload**
 
 ```json
 {
@@ -555,7 +637,7 @@ GET /api/customer/sse/orders/{orderId}/stream?token=<jwt>
 }
 ```
 
-### Status Values (lowercase — matches frontend `statusMap`)
+**Status Values (lowercase — matches frontend `statusMap`)**
 
 | Backend `OrderStatus` | SSE / API value |
 |---|---|
@@ -565,25 +647,9 @@ GET /api/customer/sse/orders/{orderId}/stream?token=<jwt>
 | `COMPLETED` | `"completed"` |
 | `CANCELLED` | `"cancelled"` |
 
-Note: `CustomerOrderDto.status` is serialised as lowercase via `order.getStatus().name().toLowerCase()`. The frontend `statusMap` in `SkipLineContext` maps `"pending"` → `"confirmed"` for display.
+Note: `CustomerOrderDto.status` is serialised as lowercase via `order.getStatus().name().toLowerCase()`. The frontend `statusMap` in `QShiftContext` maps `"pending"` → `"confirmed"` for display.
 
----
-
-## Bug Fixes & Engineering Decisions
-
-| Area | Problem | Fix |
-|---|---|---|
-| SSE always returned 401 | Spring Security evaluated `/api/customer/sse/**` against `hasRole("CUSTOMER")` before `JwtAuthFilter` ran. SecurityContext was empty at match time → 401 before `?token=` could be read | Added `requestMatchers("/api/customer/sse/**").permitAll()` **before** the `/api/customer/**` wildcard in `SecurityConfig`. Spring Security stops at first match — SSE path bypasses role check, `JwtAuthFilter` still validates the token |
-| Customer orders not found | `JwtAuthFilter` stores email as the JWT subject/principal. Orders were looked up by `customerName` which sometimes stored the display name instead of email → no orders found | `getOrdersForCustomer(email)` now does a primary lookup by email + a fallback search by email local-part to catch legacy orders stored before the fix |
-| Order ownership bypass | `getOrderForCustomer` had no ownership check — any authenticated customer could fetch any order by UUID | Added ownership check: stored `customerName` must match the requesting email or its local-part |
-| Slot booking not dropped on full-capacity rejection | When the kitchen was full, `createOrder` threw but the slot `currentBookings` had already been incremented → slot capacity permanently leaked | Added rollback: decrement `currentBookings` on the slot before throwing `SlotUnavailableException` |
-| `pickupSlotId` dropped on kitchen-side order creation | `OrderController.createOrder()` called the 3-arg `createOrder` overload — `pickupSlotId` from `CreateOrderRequest` was silently ignored for all simulation orders | Changed to call the 4-arg overload, passing `request.pickupSlotId()` |
-| Metrics always showed 0 all day | `MetricsService` used `Instant.now().atZone(ZoneId.systemDefault())` which was UTC midnight (05:30 IST) — no orders were "today" until 05:30 | Changed to `ZoneId.of("Asia/Kolkata")` — `startOfDay` is now midnight IST |
-| Board payload included all historical slots | `getBoardSnapshot()` called `findAll()` on slots — returned every slot ever seeded, including past ones. Frontend had to filter client-side; stale data inflated the payload on every 10s poll | Changed to `findBySlotTimeAfterOrderBySlotTimeAsc(now)` — only future slots returned |
-| Deadlock in simulation | `promoteNextPendingOrder` (REQUIRES_NEW) locked an order row, then called `autoAssignChef(orderId)` which called `findByIdWithLock` on the same row. Two concurrent ticks → DB deadlock | `promoteNextPendingOrder` now passes the already-locked `Order` entity directly to `assignChefToOrder()`. `assignChefToOrder` only locks the chef row — zero duplicate order row locks |
-| `OrderStatus.java` not serialised as lowercase | `CustomerOrderDto` used `order.getStatus()` directly → serialised as uppercase `"PENDING"`. Frontend `statusMap` looked up lowercase keys → always fell through to default | `CustomerOrderDto.from()` calls `order.getStatus().name().toLowerCase()` |
-| `totalPrice` missing from customer response | `CustomerOrderDto` had no `totalPrice` field → `OrderHistory` always showed "—" | Added `totalPrice` computed as `sum(menuItem.price × quantity)` for all order items |
-| `Order` entity missing DB indexes | `findByStatus()` called on every 10s board poll — full table scan at scale | Added `@Index` on `status` and `placed_at` columns |
+</details>
 
 ---
 
@@ -591,7 +657,9 @@ Note: `CustomerOrderDto.status` is serialised as lowercase via `order.getStatus(
 
 | Repository | Description |
 |---|---|
-| [skipline-frontend](https://github.com/Bhakti0394/QLess-frontend) | React + TypeScript frontend — customer and kitchen dashboards |
+| [QShift-frontend](https://github.com/Bhakti0394/QShift-frontend) | React + TypeScript frontend — customer and kitchen dashboards |
+
+> Note: verify these repo names/URLs match your actual GitHub repos before publishing — standardize on either `QShift` or `QLess` across both repos, not a mix of both.
 
 ---
 
